@@ -15,9 +15,11 @@ pipeline {
   environment {
     AWS_ACCOUNT_ID = credentials("AWS_ACCOUNT_ID")
     AWS_PROFILE = credentials("AWS_PROFILE")
+    CLUSTER_NAME = credentials("CLUSTER_NAME")
     COMMIT_HASH = "${sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()}"
     DOCKER_IMAGE = "underwriter"
     ECR_REGION = credentials("AWS_REGION")
+    IS_ECS = getIsECS()
   }
 
   stages {
@@ -64,10 +66,17 @@ pipeline {
         createEnvFile()
       }
     }
-    stage("Deploy to ECS"){
+    stage("Update Cluster"){
       steps {
-        sh "docker context use prod-jd"
-        sh "docker compose -p $DOCKER_IMAGE-jd --env-file service.env up -d"
+        script {
+          if (env.IS_ECS) {
+            sh "docker context use prod-jd"
+            sh "docker compose -p $DOCKER_IMAGE-jd --env-file service.env up -d"
+          } else  {
+            sh "aws eks update-kubeconfig --name=$CLUSTER_NAME --region=us-east-2"
+            sh "kubectl rollout restart deploy $DOCKER_IMAGE-deployment -n backend"
+          }
+        }
       }
     }
   }
@@ -87,16 +96,19 @@ def createEnvFile() {
   writeFile file: 'service.env', text: env
 }
 
+def getIsECS() {
+    return sh(returnStdout: true, script: """aws secretsmanager  get-secret-value --secret-id prod/infrastructure/config --region us-east-2 | jq -r '.["SecretString"]' | jq -r '.["is_ecs"]'""").trim().toBoolean()
+}
+
 def upstreamToECR() {
   if (params.IS_DEPLOYING) {
-    env.CURRENT_HASH = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
     sh "cp $DOCKER_IMAGE-microservice/target/*.jar ."
     sh "docker context use default"
     sh 'aws ecr get-login-password --region $ECR_REGION --profile joshua | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$ECR_REGION.amazonaws.com'
     sh "docker build -t ${DOCKER_IMAGE} ."
-    sh 'docker tag $DOCKER_IMAGE:latest $AWS_ACCOUNT_ID.dkr.ecr.$ECR_REGION.amazonaws.com/$DOCKER_IMAGE-microservice-jd:$CURRENT_HASH'
+    sh 'docker tag $DOCKER_IMAGE:latest $AWS_ACCOUNT_ID.dkr.ecr.$ECR_REGION.amazonaws.com/$DOCKER_IMAGE-microservice-jd:$COMMIT_HASH'
     sh 'docker tag $DOCKER_IMAGE:latest $AWS_ACCOUNT_ID.dkr.ecr.$ECR_REGION.amazonaws.com/$DOCKER_IMAGE-microservice-jd:latest'
-    sh 'docker push $AWS_ACCOUNT_ID.dkr.ecr.$ECR_REGION.amazonaws.com/$DOCKER_IMAGE-microservice-jd:$CURRENT_HASH'
+    sh 'docker push $AWS_ACCOUNT_ID.dkr.ecr.$ECR_REGION.amazonaws.com/$DOCKER_IMAGE-microservice-jd:$COMMIT_HASH'
     sh 'docker push $AWS_ACCOUNT_ID.dkr.ecr.$ECR_REGION.amazonaws.com/$DOCKER_IMAGE-microservice-jd:latest'
   }
 }
